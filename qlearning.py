@@ -198,16 +198,6 @@ class RobotInfo:
         # Convert to relative direction using lookup table
         relative_dir = RELATIVE_DIRECTION_MAP[self.direction][global_dir]
         return relative_dir
-    
-    def copy(self):
-        return RobotInfo(
-            location=Location(self.location.x, self.location.y),
-            direction=self.direction,
-            goal_loc=Location(self.goal_loc.x, self.goal_loc.y),
-            scan_radius=self.scan_radius,
-            map_height=self.map_height,
-            map_width=self.map_width
-        )
 
         
     
@@ -259,7 +249,6 @@ class QLearner:
         step = 0
         path = []
         total_reward = 0
-        
         while(goal != self.robot_info.location and step < step_limit and self.map_node.grid[self.robot_info.location.y, self.robot_info.location.x] != 100):
 
             cur_map = self.map_node.grid

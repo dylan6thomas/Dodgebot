@@ -20,7 +20,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 64
 MEMORY_SIZE = 10000
 TARGET_UPDATE = 100
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 1e-4
 
 # Directions
 RIGHT = 0
@@ -38,11 +38,13 @@ TURN_RIGHT = 3
 ACTIONS = [FORWARD, BACKWARD, TURN_LEFT, TURN_RIGHT, STOP]
 
 # Rewards
+SCALE = 30
 GOAL_REWARD = 100
-CLOSER_REWARD = 10
-TIMESTEP_REWARD = -0.1
-COLLISION_REWARD = -100
-STUCK_REWARD = -5
+CLOSER_REWARD = 5
+TIMESTEP_REWARD = -.05
+COLLISION_REWARD = -50
+STUCK_REWARD = 0
+FURTHER_REWARD = .1
 
 DIR_TO_VEC = {
     RIGHT: (1, 0),
@@ -85,13 +87,23 @@ class PrioritizedReplayBuffer:
         self.pos = 0
 
     def push(self, *args):
-        max_prio = self.priorities.max() if self.buffer else 1.0
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(Transition(*args))
-        else:
-            self.buffer[self.pos] = Transition(*args)
+        transition = Transition(*args)
+        reward = args[3]
 
-        self.priorities[self.pos] = max_prio
+        # Assign higher initial priority if it’s a goal-reaching transition
+        if reward == GOAL_REWARD / SCALE:
+            print("Prioritizing goal reaching scenario")
+            max_prio = self.priorities.max() if self.buffer else 1.0
+            priority = max(5.0 * max_prio, 1.0)  # Boost goal-reaching priority
+        else:
+            priority = self.priorities.max() if self.buffer else 1.0
+
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(transition)
+        else:
+            self.buffer[self.pos] = transition
+
+        self.priorities[self.pos] = priority
         self.pos = (self.pos + 1) % self.capacity
 
     def sample(self, batch_size, beta=0.4):
@@ -137,7 +149,7 @@ class DQN(nn.Module):
         return self.net(x)
 
 class DQNLearner:
-    def __init__(self, robot_info, map_node, episodes, gamma=0.999, epsilon=1.0, epsilon_min=0.1, decay=0.999):
+    def __init__(self, robot_info, map_node, episodes, gamma=0.9, epsilon=1.0, epsilon_min=0.1, decay=0.99):
         self.robot_info = robot_info
         self.map_node = map_node
         self.episodes = episodes
@@ -148,7 +160,8 @@ class DQNLearner:
         self.closest_distance = float('inf')
 
         self.buffer = PrioritizedReplayBuffer(MEMORY_SIZE)
-        input_size = (2 * robot_info.scan_radius + 1) ** 2 + 5  # assuming 1 channel for goal_dir
+        # input_size = ((2 * robot_info.scan_radius + 1) ** 2) * 2 + 5  # assuming 1 channel for goal_dir
+        input_size = ((2 * robot_info.scan_radius + 1) ** 2) + 5
         self.policy_net = DQN(input_size=input_size, output_size=len(ACTIONS)).to(DEVICE)
         self.target_net = DQN(input_size=input_size, output_size=len(ACTIONS)).to(DEVICE)
         self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -159,6 +172,10 @@ class DQNLearner:
         self.loss_fn = torch.nn.SmoothL1Loss(beta=1.0) # Switch to huber loss
         self.steps_done = 0
         self.train_steps = 0
+
+        self.episode_rewards = []
+        self.running_avg_rewards = []
+        self.running_avg_window = 50  # or any window size you prefer
 
     def select_action(self, state, eval_mode=False):
         if not eval_mode and random.random() < self.epsilon:
@@ -196,6 +213,7 @@ class DQNLearner:
 
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
         self.optimizer.step()
 
         self.train_steps += 1
@@ -235,12 +253,25 @@ class DQNLearner:
 
             path.append(Location(self.robot_info.location.x, self.robot_info.location.y))
 
-            if reward == COLLISION_REWARD:
+            if reward == COLLISION_REWARD / SCALE:
                 break
 
         self.epsilon = max(self.epsilon_min, self.epsilon * self.decay)
         self.prev_distance = self.robot_info.location.square_distance(self.robot_info.goal_loc)
         # print(path)
+
+        self.episode_rewards.append(total_reward)
+
+        # Compute running average
+        if len(self.episode_rewards) >= self.running_avg_window:
+            avg = np.mean(self.episode_rewards[-self.running_avg_window:])
+            self.running_avg_rewards.append(avg)
+        else:
+            avg = np.mean(self.episode_rewards)
+            self.running_avg_rewards.append(avg)
+
+        print(f"Episode reward: {total_reward:.2f}, Running average reward: {avg:.2f}")
+
         return total_reward
     
     def get_path(self, start, goal):
@@ -274,7 +305,7 @@ class DQNLearner:
 
             path.append(Location(self.robot_info.location.x, self.robot_info.location.y))
 
-            if reward == COLLISION_REWARD:
+            if reward == COLLISION_REWARD / SCALE:
                 break
 
         # print(path)
@@ -317,21 +348,21 @@ class DQNLearner:
         if robot_info is None:
             robot_info = self.robot_info
         if map[robot_info.location.y, robot_info.location.x] == OCCUPIED:
-            return COLLISION_REWARD
+            return COLLISION_REWARD / SCALE
         elif robot_info.location == robot_info.goal_loc:
             print(f"Found goal {robot_info.goal_loc}, our location is {robot_info.location}")
-            return GOAL_REWARD
-        elif robot_info.location.square_distance(robot_info.goal_loc) == self.prev_distance:
-            return STUCK_REWARD + TIMESTEP_REWARD
+            return GOAL_REWARD / SCALE
         else:
             new_distance = robot_info.location.square_distance(robot_info.goal_loc)
-            if(new_distance < self.closest_distance):
+            if new_distance < self.closest_distance:
                 reward = TIMESTEP_REWARD + CLOSER_REWARD * (self.closest_distance - new_distance)
                 self.closest_distance = new_distance
-                return reward
+                return reward / SCALE
+            elif new_distance > self.closest_distance:
+                return (TIMESTEP_REWARD - FURTHER_REWARD * (new_distance - self.closest_distance)) / SCALE
+            else:
+                return (STUCK_REWARD + TIMESTEP_REWARD) / SCALE
                 
-            return TIMESTEP_REWARD
-
     def take_action(self, action, robot_info = None):
         if robot_info is None:
             if action in [FORWARD, BACKWARD]:
@@ -346,7 +377,9 @@ class DQNLearner:
 
     def get_full_state_vector(self, state_obj):
         flat_map = state_obj.radius_map.flatten().astype(np.float32)
+        # flat_prev = state_obj.previous_scan.flatten().astype(np.float32)
         goal_dir_onehot = np.eye(5, dtype=np.float32)[state_obj.goal_dir]
+        # return np.concatenate([flat_map, flat_prev, goal_dir_onehot])
         return np.concatenate([flat_map, goal_dir_onehot])
 
 class DQNNode(Node):
@@ -438,7 +471,7 @@ def main(args=None):
         location=start,
         direction=RIGHT,
         goal_loc=goal,
-        scan_radius=3,
+        scan_radius=4,
         map_height=GRID_HEIGHT,
         map_width=GRID_WIDTH
     )
