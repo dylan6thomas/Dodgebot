@@ -47,16 +47,22 @@ CLOSER_REWARD = 10
 TIMESTEP_REWARD = -0.1
 COLLISION_REWARD = -600
 
+SCAN_HISTORY_LEN = 3
+
 class State:
-  def __init__(self, radius_map, goal_dir):
-    self.radius_map = radius_map
-    self.goal_dir = goal_dir
-  
-  def __eq__(self, other):
-    return np.array_equal(self.radius_map, other.radius_map) and self.goal_dir == other.goal_dir
-  
-  def __hash__(self):
-    return hash((self.radius_map.tobytes(), self.goal_dir))
+    def __init__(self, scan_action_history, goal_dir, scan_history_len=3):
+        self.goal_dir = goal_dir
+        self.scan_history_len = scan_history_len
+        self.scan_action_history = scan_action_history  # will store tuples of (radius_map, action)
+    
+    def __eq__(self, other):
+        if self.goal_dir != other.goal_dir or len(self.scan_action_pairs) != len(other.scan_action_pairs):
+            return False
+        return all(np.array_equal(a[0], b[0]) and a[1] == b[1]
+               for a, b in zip(self.scan_action_pairs, other.scan_action_pairs))
+
+    def __hash__(self):
+        return hash((tuple((s.tobytes(), a) for s, a in self.scan_action_pairs), self.goal_dir))
   
 class Location:
   def __init__(self, x, y):
@@ -92,46 +98,78 @@ class RobotInfo:
         else:
             self.q_table = q_table
 
+        dummy_scan = np.full((2 * self.scan_radius + 1, 2 * self.scan_radius + 1), -1, dtype=np.int8)
+        self.scan_action_history = [(dummy_scan.copy(), None) for _ in range(SCAN_HISTORY_LEN)]
+
   # This will have to be changed when we make it actually process laser scans
+    # def get_state(self, map):
+    #     updated_map = map.copy()
+
+    #     if self.previous_map is not None:
+    #         updated_map, updated_decay = self.update_change_tracker(self.previous_map, map, self.decay_map)
+    #     else:
+    #         updated_decay = np.zeros_like(updated_map)
+
+    #     # Pad the map with UNKNOWN (-1) around edges
+    #     padded_map = np.pad(updated_map, 
+    #                         pad_width=self.scan_radius, 
+    #                         mode='constant', 
+    #                         constant_values=-1)
+
+    #     # Adjust robot location for padded map coordinates
+    #     cx = self.location.x + self.scan_radius
+    #     cy = self.location.y + self.scan_radius
+
+    #     # Extract fixed-size patch centered at robot
+    #     radius = padded_map[
+    #         cy - self.scan_radius : cy + self.scan_radius + 1,
+    #         cx - self.scan_radius : cx + self.scan_radius + 1
+    #     ]
+
+    #     # Rotate patch according to direction (ensure direction is int in [0..3])
+    #     radius_rotated = np.rot90(radius, k=self.direction)
+
+    #     # Scan the rotated patch
+    #     scan = self.scan(radius_rotated)
+
+    #     goal_dir = self.get_goal_dir()
+
+    #     self.current_state = State(scan, goal_dir)
+
+    #     self.previous_map = updated_map
+    #     self.decay_map = updated_decay
+    #     return self.current_state
     def get_state(self, map):
         updated_map = map.copy()
 
-        if self.previous_map is not None:
-            updated_map, updated_decay = self.update_change_tracker(self.previous_map, map, self.decay_map)
-        else:
-            updated_decay = np.zeros_like(updated_map)
-
-        # Pad the map with UNKNOWN (-1) around edges
-        padded_map = np.pad(updated_map, 
-                            pad_width=self.scan_radius, 
-                            mode='constant', 
+        # Padding and rotating
+        padded_map = np.pad(updated_map,
+                            pad_width=self.scan_radius,
+                            mode='constant',
                             constant_values=-1)
 
-        # Adjust robot location for padded map coordinates
         cx = self.location.x + self.scan_radius
         cy = self.location.y + self.scan_radius
 
-        # Extract fixed-size patch centered at robot
         radius = padded_map[
-            cy - self.scan_radius : cy + self.scan_radius + 1,
-            cx - self.scan_radius : cx + self.scan_radius + 1
+            cy - self.scan_radius:cy + self.scan_radius + 1,
+            cx - self.scan_radius:cx + self.scan_radius + 1
         ]
 
-        # Rotate patch according to direction (ensure direction is int in [0..3])
         radius_rotated = np.rot90(radius, k=self.direction)
-
-        # Scan the rotated patch
         scan = self.scan(radius_rotated)
-
         goal_dir = self.get_goal_dir()
 
-        self.current_state = State(scan, goal_dir)
+        # Use previously recorded history
+        history = self.scan_action_history[-(SCAN_HISTORY_LEN - 1):]
+        history = list(history)
+        history.append((scan.copy(), None))  # Add current scan with unknown action
+        self.current_state = State(history, goal_dir, SCAN_HISTORY_LEN)
 
-        self.previous_map = updated_map
-        self.decay_map = updated_decay
+        self.current_state = State(history, goal_dir, SCAN_HISTORY_LEN)
         return self.current_state
     
-    def scan(self, radius,  num_rays=60):
+    def scan(self, radius,  num_rays=120):
         scan = np.ones_like(radius) * -1 # start as unknown
 
         cx, cy = self.location.x, self.location.y
@@ -202,12 +240,14 @@ class RobotInfo:
         
     
     def turn_dir(self, turn_dir):
+        self._record_action(turn_dir)
         if turn_dir == TURN_LEFT:
             self.direction = (self.direction - 1) % 4
         elif turn_dir ==TURN_RIGHT:
             self.direction = (self.direction + 1) % 4
     
     def move(self, direction):
+        self._record_action(direction)
         if direction == FORWARD:
             step = 1
         elif direction ==  BACKWARD:
@@ -227,6 +267,13 @@ class RobotInfo:
     def get_best_value(self):
         actions = [FORWARD, BACKWARD, TURN_LEFT, TURN_RIGHT, STOP]
         return max([self.q_table[(self.current_state, action)] for action in actions])
+    
+    def _record_action(self, action):
+        if self.current_state is not None:
+            latest_scan = self.current_state.scan_action_history[-1][0]
+            self.scan_action_history.append((latest_scan.copy(), action))
+            if len(self.scan_action_history) > SCAN_HISTORY_LEN:
+                self.scan_action_history.pop(0)
 
 class QLearner:
 

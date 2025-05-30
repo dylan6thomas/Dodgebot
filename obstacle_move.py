@@ -6,13 +6,18 @@ from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import Header
 import numpy as np
 
+import random
+
 MAP_TOPIC = 'moving_map'
 USE_SIM_TIME = True
 TF_ODOM_LINK = 'odom'
 
 RESOLUTION = 1.0  # meters
+# GRID_HEIGHT = 10
+# GRID_WIDTH = 10
 GRID_HEIGHT = 10
 GRID_WIDTH = 10
+NUM_RECTS = 3
 FREQUENCY = 1  # Hz
 
 UNKNOWN = -1
@@ -67,14 +72,18 @@ class MovingMap(Node):
         self.grid: np.ndarray = np.full((self.height, self.width), FREE, dtype=np.int8)
         self.origin_x = - (self.width / 2) * self.resolution
         self.origin_y = - (self.height / 2) * self.resolution
-        self.obstacles = [
-            # DynamicRect(self.height-2, self.width-2,  0, -1),   # right moving left
-            # DynamicRect(self.height//2, self.width//2, 1,  0),   # middle moving up
-            # DynamicRect(2, 2,  0,  1)                   # left moving right
-            DynamicRect(self.height-2, self.width-2,  0, 0),   # right moving left
-            DynamicRect(self.height//2, self.width//2, 0,  0),   # middle moving up
-            DynamicRect(2, 2,  0,  0)                   # left moving right
-        ]
+        # self.origin_x = - float(self.width) * self.resolution
+        # self.origin_y = - float(self.height) * self.resolution
+        speeds = [0.5, -0.5, 0, 0]
+        # self.obstacles = [
+        #     # DynamicRect(self.height-2, self.width-2,  0, -1),   # right moving left
+        #     # DynamicRect(self.height//2, self.width//2, 1,  0),   # middle moving up
+        #     # DynamicRect(2, 2,  0,  1)                   # left moving right
+        #     DynamicRect(self.height-2, self.width-2,  0, -0.5),   # right moving left
+        #     DynamicRect(self.height//2, self.width//2, 0.5,  0),   # middle moving up
+        #     DynamicRect(2, 2,  0,  0.5)                   # left moving right
+        # ]
+        self.obstacles = [DynamicRect(random.randint(3, GRID_HEIGHT - 2), random.randint(3, GRID_WIDTH - 2), random.choice(speeds), random.choice(speeds)) for i in range(NUM_RECTS)]
     
     def make_header(self):
         hdr = Header()
@@ -85,7 +94,7 @@ class MovingMap(Node):
     def draw_obstacles(self):
       self.grid.fill(FREE)
       for obs in self.obstacles:
-          r, c = obs.row, obs.col            # top-left
+          r, c = int(obs.row), int(obs.col)            # top-left
         #   self.grid[r  : r+2, c  : c+2] = 100   # 2×2 slice
           self.grid[r  : r+1, c  : c+1] = 100   # 2×2 slice
 

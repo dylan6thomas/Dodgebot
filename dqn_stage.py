@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import deque, namedtuple
-from qlearning import Location, RobotInfo, SCAN_HISTORY_LEN
+from qlearning import Location, RobotInfo
 
 from obstacle_move import MovingMap, OCCUPIED, FREE, UNKNOWN, MAP_TOPIC, GRID_HEIGHT, GRID_WIDTH
 from geometry_msgs.msg import PoseStamped
@@ -14,8 +14,6 @@ from nav_msgs.msg import OccupancyGrid, Path
 import rclpy
 from rclpy.node import Node
 
-#TODO Normalize rewards?
-
 # Constants
 FREQUENCY = 20
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,7 +21,7 @@ BATCH_SIZE = 64
 MEMORY_SIZE = 10000
 TARGET_UPDATE = 100
 LEARNING_RATE = 1e-4
-CHANGE_MAP_COUNT = 1
+CHANGE_MAP_COUNT = 10
 
 # Directions
 RIGHT = 0
@@ -40,25 +38,14 @@ TURN_LEFT = 2
 TURN_RIGHT = 3
 ACTIONS = [FORWARD, BACKWARD, TURN_LEFT, TURN_RIGHT, STOP]
 
-# # Rewards
-# # SCALE = 30
-SCALE = 1
-# # GOAL_REWARD = 100
-# GOAL_REWARD = 500
-# # CLOSER_REWARD = 5
-# CLOSER_REWARD = 3
-# # TIMESTEP_REWARD = -.05
-# TIMESTEP_REWARD = -0.3
-# COLLISION_REWARD = -50
-# STUCK_REWARD = 0
-# FURTHER_REWARD = .1
-
-GOAL_REWARD = 100     # Reduce to be less dominant
-CLOSER_REWARD = 1.0   # Give clear positive feedback
-FURTHER_REWARD = -1.0 # Penalize for making the wrong move
-TIMESTEP_REWARD = -0.1 # Encourage faster paths
-COLLISION_REWARD = -10
-STUCK_REWARD = -2     # Penalize being stuck
+# Rewards
+SCALE = 30
+GOAL_REWARD = 100
+CLOSER_REWARD = 5
+TIMESTEP_REWARD = -.05
+COLLISION_REWARD = -50
+STUCK_REWARD = 0
+FURTHER_REWARD = .1
 
 DIR_TO_VEC = {
     RIGHT: (1, 0),
@@ -98,17 +85,17 @@ class PrioritizedReplayBuffer:
         self.alpha = alpha  # how much prioritization is used (0 = uniform)
         self.buffer = []
         self.priorities = np.zeros((capacity,), dtype=np.float32)
-        self.capacity = capacity
         self.pos = 0
 
-    def push(self, *args, done=False):
+    def push(self, *args):
         transition = Transition(*args)
         reward = args[3]
 
-        if done:
-            print("[PUSH] Prioritizing goal (done=True)")
+        # Assign higher initial priority if it’s a goal-reaching transition
+        if reward == GOAL_REWARD / SCALE:
+            print("Prioritizing goal reaching scenario")
             max_prio = self.priorities.max() if self.buffer else 1.0
-            priority = min(max(5.0 * max_prio, 1.0), 100.0)
+            priority = max(5.0 * max_prio, 1.0)  # Boost goal-reaching priority
         else:
             priority = self.priorities.max() if self.buffer else 1.0
 
@@ -146,14 +133,9 @@ class PrioritizedReplayBuffer:
 
     def __len__(self):
         return len(self.buffer)
-    
-    def reset(self):
-        self.buffer = []
-        self.priorities = np.zeros((self.capacity,), dtype=np.float32)  # or reset sum tree structure
-        self.pos = 0
 
 class DQN(nn.Module):
-    def __init__(self, input_size, hidden_size=256, output_size=5):
+    def __init__(self, input_size, hidden_size=128, output_size=5):
         super(DQN, self).__init__()
         self.net = nn.Sequential(
             nn.Flatten(),
@@ -166,9 +148,9 @@ class DQN(nn.Module):
 
     def forward(self, x):
         return self.net(x)
-# .99 decay for 10x10
+
 class DQNLearner:
-    def __init__(self, robot_info, map_node, episodes, gamma=0.9, epsilon=1.0, epsilon_min=0.1, decay=0.995):
+    def __init__(self, robot_info, map_node, episodes, gamma=0.9, epsilon=1.0, epsilon_min=0.1, decay=0.99):
         self.robot_info = robot_info
         self.map_node = map_node
         self.episodes = episodes
@@ -180,10 +162,7 @@ class DQNLearner:
 
         self.buffer = PrioritizedReplayBuffer(MEMORY_SIZE)
         # input_size = ((2 * robot_info.scan_radius + 1) ** 2) * 2 + 5  # assuming 1 channel for goal_dir
-        scan_dim = (2 * robot_info.scan_radius + 1) ** 2
-        action_dim = len(ACTIONS)
-        scan_hist_len = SCAN_HISTORY_LEN
-        input_size = scan_hist_len * (scan_dim + action_dim) + action_dim
+        input_size = ((2 * robot_info.scan_radius + 1) ** 2) + 5
         self.policy_net = DQN(input_size=input_size, output_size=len(ACTIONS)).to(DEVICE)
         self.target_net = DQN(input_size=input_size, output_size=len(ACTIONS)).to(DEVICE)
         self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -262,11 +241,11 @@ class DQNLearner:
             self.take_action(action)
             self.map_node.publish_map()
 
-            reward, done_flag = self.compute_reward()
+            reward = self.compute_reward()
             total_reward += reward
             next_state_obj = self.robot_info.get_state(self.map_node.grid)
             next_state = self.get_full_state_vector(next_state_obj)
-            self.buffer.push(state, action, next_state, reward, done=done_flag)
+            self.buffer.push(state, action, next_state, reward)
             state = next_state
 
             self.optimize_model()
@@ -317,7 +296,7 @@ class DQNLearner:
             self.take_action(action)
             self.map_node.publish_map()
 
-            reward, done_flag = self.compute_reward()
+            reward = self.compute_reward()
             total_reward += reward
             next_state_obj = self.robot_info.get_state(self.map_node.grid)
             next_state = self.get_full_state_vector(next_state_obj)
@@ -365,45 +344,25 @@ class DQNLearner:
 
         # return path
 
-    # def compute_reward(self, robot_info=None):
-    #     map = self.map_node.grid
-    #     if robot_info is None:
-    #         robot_info = self.robot_info
-    #     if map[robot_info.location.y, robot_info.location.x] == OCCUPIED:
-    #         return COLLISION_REWARD / SCALE
-    #     elif robot_info.location == robot_info.goal_loc:
-    #         print(f"Found goal {robot_info.goal_loc}, our location is {robot_info.location}")
-    #         return GOAL_REWARD / SCALE
-    #     else:
-    #         new_distance = robot_info.location.square_distance(robot_info.goal_loc)
-    #         if new_distance < self.closest_distance:
-    #             reward = TIMESTEP_REWARD + CLOSER_REWARD * (self.closest_distance - new_distance)
-    #             self.closest_distance = new_distance
-    #             return reward / SCALE
-    #         elif new_distance > self.closest_distance:
-    #             return (TIMESTEP_REWARD - FURTHER_REWARD * (new_distance - self.closest_distance)) / SCALE
-    #         else:
-    #             return (STUCK_REWARD + TIMESTEP_REWARD) / SCALE
-
     def compute_reward(self, robot_info=None):
-        done_flag = False
+        map = self.map_node.grid
         if robot_info is None:
             robot_info = self.robot_info
-
-        if self.map_node.grid[robot_info.location.y, robot_info.location.x] == OCCUPIED:
-            return COLLISION_REWARD, done_flag
-
-        current_dist = robot_info.location.square_distance(robot_info.goal_loc)
-        delta = self.prev_distance - current_dist
-
-        reward = TIMESTEP_REWARD + delta * 0.5  # Scale appropriately
-
-        if robot_info.location == robot_info.goal_loc:
-            reward += GOAL_REWARD
-            done_flag = True
-
-        self.prev_distance = current_dist
-        return reward, done_flag
+        if map[robot_info.location.y, robot_info.location.x] == OCCUPIED:
+            return COLLISION_REWARD / SCALE
+        elif robot_info.location == robot_info.goal_loc:
+            print(f"Found goal {robot_info.goal_loc}, our location is {robot_info.location}")
+            return GOAL_REWARD / SCALE
+        else:
+            new_distance = robot_info.location.square_distance(robot_info.goal_loc)
+            if new_distance < self.closest_distance:
+                reward = TIMESTEP_REWARD + CLOSER_REWARD * (self.closest_distance - new_distance)
+                self.closest_distance = new_distance
+                return reward / SCALE
+            elif new_distance > self.closest_distance:
+                return (TIMESTEP_REWARD - FURTHER_REWARD * (new_distance - self.closest_distance)) / SCALE
+            else:
+                return (STUCK_REWARD + TIMESTEP_REWARD) / SCALE
                 
     def take_action(self, action, robot_info = None):
         if robot_info is None:
@@ -418,25 +377,11 @@ class DQNLearner:
                 robot_info.turn_dir(action)
 
     def get_full_state_vector(self, state_obj):
-        # Flatten and stack all scans
-        flat_scans = [scan.flatten().astype(np.float32) for scan, _ in state_obj.scan_action_history]
-        scan_vector = np.concatenate(flat_scans)
-
-        # Optional: encode actions as one-hot if not None, else zeros
-        action_vector = []
-        for _, action in state_obj.scan_action_history:
-            onehot = np.zeros(5, dtype=np.float32)  # FORWARD, BACKWARD, LEFT, RIGHT, STOP
-            if action is not None:
-                onehot[action] = 1.0
-            action_vector.append(onehot)
-
-        action_vector = np.concatenate(action_vector)
-
-        # Goal direction as one-hot
+        flat_map = state_obj.radius_map.flatten().astype(np.float32)
+        # flat_prev = state_obj.previous_scan.flatten().astype(np.float32)
         goal_dir_onehot = np.eye(5, dtype=np.float32)[state_obj.goal_dir]
-
-        # Combine all
-        return np.concatenate([scan_vector, action_vector, goal_dir_onehot])
+        # return np.concatenate([flat_map, flat_prev, goal_dir_onehot])
+        return np.concatenate([flat_map, goal_dir_onehot])
 
 class DQNNode(Node):
     def __init__(self, robot_info, map_node, start, goal, episodes=1000):
@@ -447,22 +392,16 @@ class DQNNode(Node):
         self.learner = DQNLearner(robot_info, map_node, episodes)
         self.start = start
         self.goal = goal
-        self.change_map_count = 0
 
         self.timer = self.create_timer(1.0 / FREQUENCY, self.train_loop)
+
+        self.change_map_count = 0
 
     def train_loop(self):
         reward = self.learner.train_episode(self.start, self.goal)
         print(f"Episode complete. Total reward: {reward}")
         print(f"Node start: {self.start}")
         self.publish_path()
-
-        self.change_map_count += 1
-        while self.change_map_count >= CHANGE_MAP_COUNT or self.map_node.grid[self.goal.y, self.goal.y] == OCCUPIED:
-            print("Changing map")
-            self.map_node._init_map()
-            # self.learner.buffer.reset()
-            self.change_map_count = 0
 
     def publish_path(self):
         path = self.learner.get_path(self.start, self.goal)
@@ -535,8 +474,7 @@ def main(args=None):
         location=start,
         direction=RIGHT,
         goal_loc=goal,
-        scan_radius=5,
-        # scan_radius=4
+        scan_radius=4,
         map_height=GRID_HEIGHT,
         map_width=GRID_WIDTH
     )
