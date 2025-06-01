@@ -47,7 +47,7 @@ CLOSER_REWARD = 10
 TIMESTEP_REWARD = -0.1
 COLLISION_REWARD = -600
 
-SCAN_HISTORY_LEN = 3
+SCAN_HISTORY_LEN = 5
 
 class State:
     def __init__(self, scan_action_history, goal_dir, scan_history_len=3):
@@ -160,6 +160,8 @@ class RobotInfo:
         scan = self.scan(radius_rotated)
         goal_dir = self.get_goal_dir()
 
+        # goal_dir = self.get_goal_angle()
+
         # Use previously recorded history
         history = self.scan_action_history[-(SCAN_HISTORY_LEN - 1):]
         history = list(history)
@@ -236,8 +238,45 @@ class RobotInfo:
         # Convert to relative direction using lookup table
         relative_dir = RELATIVE_DIRECTION_MAP[self.direction][global_dir]
         return relative_dir
+    
+    def get_goal_angle(self):
+        """
+        Computes the angle from the robot's position to the goal, relative to its current facing direction.
+        Returns:
+            angle (float): Angle in radians, in range [-π, π], where 0 means straight ahead.
+        """
+        # Vector from robot to goal
+        dx = self.goal_loc.x - self.location.x
+        dy = self.goal_loc.y - self.location.y
 
-        
+        if dx == 0 and dy == 0:
+            return 0.0  # Already at goal
+
+        # Absolute angle to goal (from world frame)
+        goal_angle = math.atan2(dy, dx)
+
+        # Robot facing direction vector (world frame)
+        direction_vectors = {
+            RIGHT: (1, 0),
+            UP:    (0, -1),
+            LEFT:  (-1, 0),
+            DOWN:  (0, 1),
+        }
+        fx, fy = direction_vectors[self.direction]
+
+        # Convert facing direction vector to angle
+        robot_angle = math.atan2(fy, fx)
+
+        # Relative angle = goal angle - robot angle
+        relative_angle = goal_angle - robot_angle
+
+        # Normalize to [-π, π]
+        while relative_angle > math.pi:
+            relative_angle -= 2 * math.pi
+        while relative_angle < -math.pi:
+            relative_angle += 2 * math.pi
+
+        return relative_angle / (2 * math.pi)
     
     def turn_dir(self, turn_dir):
         self._record_action(turn_dir)

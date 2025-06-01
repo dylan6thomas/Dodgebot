@@ -18,11 +18,7 @@ import torch.nn.functional as F
 
 import os
 
-random.seed(42)
-
-#TODO Normalize rewards?
-
-# What I did: hidden_dim from 512->1048, reduced rewards by 10x
+random.seed(0)
 
 # Constants
 FREQUENCY = 20
@@ -30,7 +26,8 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 128
 MEMORY_SIZE = 10000
 TARGET_UPDATE = 100
-LEARNING_RATE = 3e-4
+# At checkpoint 17, lowered learning rate from 3e-4 to 1e-4, resumed training
+LEARNING_RATE = 1e-4
 CHANGE_MAP_COUNT = 1
 
 # Directions
@@ -48,26 +45,22 @@ TURN_LEFT = 2
 TURN_RIGHT = 3
 ACTIONS = [FORWARD, BACKWARD, TURN_LEFT, TURN_RIGHT, STOP]
 
-# # Rewards
-# # SCALE = 30
 SCALE = 1
-# # GOAL_REWARD = 100
-# GOAL_REWARD = 500
-# # CLOSER_REWARD = 5
-# CLOSER_REWARD = 3
-# # TIMESTEP_REWARD = -.05
-# TIMESTEP_REWARD = -0.3
-# COLLISION_REWARD = -50
-# STUCK_REWARD = 0
-# FURTHER_REWARD = .1
 
-GOAL_REWARD = 50
-CLOSER_REWARD = .5
-FURTHER_REWARD = -0.05
-TIMESTEP_REWARD = -0.01
-COLLISION_REWARD = -5.0
-REACHED_STEP_LIMIT_REWARD = -0.8
-STUCK_REWARD = -0.01
+# GOAL_REWARD = 50     # Reduce to be less dominant
+# CLOSER_REWARD = .5   # Give clear positive feedback
+# FURTHER_REWARD = -.05 # Penalize for making the wrong move
+# TIMESTEP_REWARD = -.01 # Encourage faster paths
+# COLLISION_REWARD = -5.0
+# STUCK_REWARD = -0.01    # Penalize being stuck
+# REACHED_STEP_LIMIT_REWARD = -.8
+GOAL_REWARD = 50     # Reduce to be less dominant
+CLOSER_REWARD = 1.0   # Give clear positive feedback
+FURTHER_REWARD = -.1 # Penalize for making the wrong move
+TIMESTEP_REWARD = -.1 # Encourage faster paths
+COLLISION_REWARD = -10.0
+STUCK_REWARD = -0.01   # Penalize being stuck
+REACHED_STEP_LIMIT_REWARD = -.8
 STEP_LIMIT = 250
 INITIAL_DISTANCE_LIMIT = 4
 
@@ -104,7 +97,7 @@ from collections import namedtuple
 
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
 
-# https://arxiv.org/abs/1511.05952 Prioritiezed Replay Buffer
+# https://arxiv.org/abs/1511.05952 Prioritized Replay Buffer
 class PrioritizedReplayBuffer:
     def __init__(self, capacity, alpha=0.6):
         self.capacity = capacity
@@ -172,8 +165,10 @@ class DQN(nn.Module):
             nn.Flatten(),
             nn.Linear(input_size, hidden_size),
             nn.ReLU(),
+            nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
+            nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, output_size)
         )
 
@@ -181,7 +176,7 @@ class DQN(nn.Module):
         return self.net(x)
 # .99 decay for 10x10
 class DQNLearner:
-    def __init__(self, robot_info, map_node, episodes, gamma=0.99, epsilon=1.0, epsilon_min=0.1, decay=0.995, max_distance=INITIAL_DISTANCE_LIMIT):
+    def __init__(self, robot_info, map_node, episodes, gamma=0.95, epsilon=1.0, epsilon_min=0.1, decay=0.995):
         self.robot_info = robot_info
         self.map_node = map_node
         self.episodes = episodes
@@ -219,7 +214,6 @@ class DQNLearner:
         self.success_window_avg = 0
 
         self.episode_count = 0
-        self.max_distance = max_distance
 
     def select_action(self, state, eval_mode=False):
         if not eval_mode and random.random() < self.epsilon:
@@ -275,6 +269,7 @@ class DQNLearner:
 
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
         self.optimizer.step()
 
@@ -352,7 +347,8 @@ class DQNLearner:
         print(f"Episode loss: {total_loss:.2f}, Running average loss: {avg:.2f}")
 
         self.episode_successes.append(int(done_flag))
-        self.success_window_avg = np.mean(self.episode_successes[-self.success_window:])
+        if len(self.episode_successes) >= self.success_window:
+            self.success_window_avg = np.mean(self.episode_successes[-self.success_window:])
 
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(DEVICE)
         q_values = self.policy_net(state_tensor).squeeze().detach().cpu().numpy()
@@ -365,7 +361,7 @@ class DQNLearner:
         self.episode_count += 1
         return total_reward
     
-    def get_path(self, start, goal):
+    def get_path(self, start, goal, step_limit):
         print(f"Training episode with start {start} and goal {goal}")
         self.robot_info.location = Location(start.x, start.y)
         self.robot_info.goal_loc = Location(goal.x, goal.y)
@@ -375,7 +371,7 @@ class DQNLearner:
         state_obj = self.robot_info.get_state(self.map_node.grid)
         state = self.get_full_state_vector(state_obj)
         steps = 0
-        step_limit = STEP_LIMIT
+        step_limit = step_limit
         done_flag = False
 
         path = [Location(self.robot_info.location.x, self.robot_info.location.y)]
@@ -414,7 +410,7 @@ class DQNLearner:
         collided_flag = False
         # reward_scale = 1 / math.sqrt(start.square_distance(goal))
         distance = math.sqrt(start.square_distance(goal))
-        reward_scale = max(1, distance / INITIAL_DISTANCE_LIMIT)
+        reward_scale = math.log(distance + 1) / distance if distance > 0 else 1
         if robot_info is None:
             robot_info = self.robot_info
 
@@ -454,7 +450,7 @@ class DQNLearner:
     def get_full_state_vector(self, state_obj):
         # Flatten and stack all scans
         flat_scans = [scan.flatten().astype(np.float32) for scan, _ in state_obj.scan_action_history]
-        scan_vector = np.concatenate(flat_scans)
+        scan_vector = np.concatenate(flat_scans) / 100
 
         # Optional: encode actions as one-hot if not None, else zeros
         action_vector = []
@@ -468,17 +464,11 @@ class DQNLearner:
 
         # Goal direction as one-hot
         goal_dir_onehot = np.eye(5, dtype=np.float32)[state_obj.goal_dir]
-        # goal_dir = np.array([state_obj.goal_dir])
 
-        # distance_vector = np.array([math.sqrt(self.robot_info.location.square_distance(self.robot_info.goal_loc))])
-        # normalized_distance_vector = np.array([math.sqrt(self.robot_info.location.square_distance(self.robot_info.goal_loc)/(2 * self.max_distance**2))])
-        max_distance_vector = np.array([math.sqrt(self.robot_info.location.square_distance(self.robot_info.goal_loc)/(GRID_HEIGHT ** 2 + GRID_WIDTH ** 2))])
 
 
         # Combine all
-        return np.concatenate([scan_vector, action_vector, goal_dir_onehot, max_distance_vector])
-        # return np.concatenate([scan_vector, action_vector, goal_dir_onehot, normalized_distance_vector, max_distance_vector])
-        # return np.concatenate([scan_vector, action_vector, goal_dir, normalized_distance_vector, max_distance_vector])
+        return np.concatenate([scan_vector, action_vector, goal_dir_onehot, np.array([math.sqrt(self.robot_info.location.square_distance(self.robot_info.goal_loc))])])
     
     import os
 
@@ -496,8 +486,7 @@ class DQNLearner:
             'episode_losses': self.episode_losses,
             'running_avg_losses': self.running_avg_losses,
             'episode_successes': self.episode_successes,
-            # 'success_window_avg': self.success_window_avg,
-            'success_window_avg': 0,
+            'success_window_avg': self.success_window_avg,
             'replay_buffer': self.buffer,
             'extra_info': extra_info,
         }
@@ -520,7 +509,6 @@ class DQNLearner:
         self.episode_successes = checkpoint['episode_successes']
         self.success_window_avg = checkpoint['success_window_avg']
         self.buffer = checkpoint['replay_buffer']
-        # Add this to save function
         print(f"[Checkpoint] Loaded model and training state from {load_path}")
 
 class DQNNode(Node):
@@ -529,20 +517,14 @@ class DQNNode(Node):
         self.path_pub = self.create_publisher(Path, '/dqn/path', 10)
         self.robot_info = robot_info
         self.map_node = map_node
-        self.learner = DQNLearner(robot_info, map_node, episodes, max_distance=max_distance)
+        self.learner = DQNLearner(robot_info, map_node, episodes)
         self.change_map_count = 0
+        self.start = start
+        self.goal = goal
         if load_path is not None and os.path.exists(load_path) and max_distance > 0:
             self.learner.load_checkpoint(load_path)
             self.max_distance = max_distance
-            self.goal = Location(random.randint(0, GRID_WIDTH-1), random.randint(0, GRID_HEIGHT-1))
-            self.start = Location(random.randint(max(0, self.goal.x - self.max_distance), min(GRID_WIDTH - 1, self.goal.x + self.max_distance)),
-                                    random.randint(max(0, self.goal.y - self.max_distance), min(GRID_HEIGHT - 1, self.goal.y + self.max_distance)))
-            while(self.start == self.goal):
-                self.start = Location(random.randint(max(0, self.goal.x - self.max_distance), min(GRID_WIDTH - 1, self.goal.x + self.max_distance)),
-                                    random.randint(max(0, self.goal.y - self.max_distance), min(GRID_HEIGHT - 1, self.goal.y + self.max_distance)))
         else:
-            self.start = start
-            self.goal = goal
             self.max_distance = INITIAL_DISTANCE_LIMIT
 
         self.timer = self.create_timer(1.0 / FREQUENCY, self.train_loop)
@@ -551,16 +533,15 @@ class DQNNode(Node):
         reward = self.learner.train_episode(self.start, self.goal, self.max_distance*2 * 4)
         print(f"Episode complete. Total reward: {reward}")
         print(f"Node start: {self.start}")
-        # self.publish_path()
+        self.publish_path()
 
         print(f"Current success window average (len {len(self.learner.episode_successes)}): ", self.learner.success_window_avg)
         if len(self.learner.episode_successes) > self.learner.success_window and self.learner.success_window_avg >= INC_DIFFICULTY_THRESH:
             self.max_distance = min(GRID_WIDTH-1, GRID_HEIGHT-1, self.max_distance+1)
             print("Changed max distance to ", self.max_distance)
             self.learner.episode_successes = self.learner.episode_successes[-20:]
-            self.learner.epsilon = max(self.learner.epsilon, 0.4)
-            self.learner.decay = 0.997
-            self.learner.max_distance = self.max_distance
+            self.learner.epsilon = max(self.learner.epsilon, 0.3)
+            self.learner.decay = 0.995
 
             self.learner.save_checkpoint(f"checkpoints/model_distance_{self.max_distance}.pt", {
                 'start': self.start,
@@ -572,15 +553,17 @@ class DQNNode(Node):
         while self.change_map_count >= CHANGE_MAP_COUNT or self.map_node.grid[self.goal.y, self.goal.y] == OCCUPIED:
             print("Changing map")
             self.goal = Location(random.randint(0, GRID_WIDTH-1), random.randint(0, GRID_HEIGHT-1))
-            self.start = self.sample_start_location()
-            while self.start == self.goal:
-                self.start = self.sample_start_location()
+            self.start = Location(random.randint(max(0, self.goal.x - self.max_distance), min(GRID_WIDTH - 1, self.goal.x + self.max_distance)),
+                                  random.randint(max(0, self.goal.y - self.max_distance), min(GRID_HEIGHT - 1, self.goal.y + self.max_distance)))
+            while(self.start == self.goal):
+                self.start = Location(random.randint(max(0, self.goal.x - self.max_distance), min(GRID_WIDTH - 1, self.goal.x + self.max_distance)),
+                                  random.randint(max(0, self.goal.y - self.max_distance), min(GRID_HEIGHT - 1, self.goal.y + self.max_distance)))
             self.map_node._init_map()
             # self.learner.buffer.reset()
             self.change_map_count = 0
 
     def publish_path(self):
-        path = self.learner.get_path(self.start, self.goal)
+        path = self.learner.get_path(self.start, self.goal, self.max_distance*2 * 4)
 
         # Publish path as ROS message
         path_msg = Path()
@@ -597,71 +580,6 @@ class DQNNode(Node):
             path_msg.poses.append(pose)
 
         self.path_pub.publish(path_msg)
-
-    def simulate_action(self, loc, direction, action):
-        """
-        Given a current location and direction, simulate the result of an action.
-        Returns a (Location, direction) tuple. If the move would go out of bounds, location remains unchanged.
-        """
-        map_height = self.map_node.grid.shape[0]
-        map_width = self.map_node.grid.shape[1]
-
-        new_loc = loc
-        new_direction = direction
-
-        if action == FORWARD:
-            dx, dy = DIR_TO_VEC[direction]
-            candidate_loc = Location(loc.x + dx, loc.y + dy)
-
-            # Check if candidate location is within bounds
-            if 0 <= candidate_loc.x < map_width and 0 <= candidate_loc.y < map_height:
-                new_loc = candidate_loc
-
-        elif action == BACKWARD:
-            dx, dy = DIR_TO_VEC[direction]
-            candidate_loc = Location(loc.x - dx, loc.y - dy)
-
-            if 0 <= candidate_loc.x < map_width and 0 <= candidate_loc.y < map_height:
-                new_loc = candidate_loc
-
-        elif action == TURN_LEFT:
-            new_direction = (direction - 1) % 4
-
-        elif action == TURN_RIGHT:
-            new_direction = (direction + 1) % 4
-
-        elif action == STOP:
-            pass  # do nothing
-
-        else:
-            raise ValueError(f"Unknown action: {action}")
-
-        return new_loc, new_direction
-    def sample_start_location(self):
-        goal = self.goal
-        max_d = self.max_distance
-
-        # Sample further away when in early stage of new difficulty
-        # if self.learner.epsilon > self.learner.epsilon_min and max_d > INITIAL_DISTANCE_LIMIT:
-        #     # Bias to sample toward outer ring
-        #     for _ in range(100):  # try 100 times to find a valid far start
-        #         angle = random.uniform(0, 2 * math.pi)
-        #         r = random.uniform(max_d * 0.7, max_d)  # biased to farther distances
-        #         dx = int(round(r * math.cos(angle)))
-        #         dy = int(round(r * math.sin(angle)))
-
-        #         start_x = goal.x + dx
-        #         start_y = goal.y + dy
-
-        #         if 0 <= start_x < GRID_WIDTH and 0 <= start_y < GRID_HEIGHT:
-        #             return Location(start_x, start_y)
-
-        # Fallback to uniform sampling in square region
-        start = Location(
-            random.randint(max(0, goal.x - max_d), min(GRID_WIDTH - 1, goal.x + max_d)),
-            random.randint(max(0, goal.y - max_d), min(GRID_HEIGHT - 1, goal.y + max_d))
-        )
-        return start
 
 def main(args=None):
     rclpy.init(args=args)
@@ -681,7 +599,7 @@ def main(args=None):
         map_width=GRID_WIDTH
     )
 
-    # dqn_node = DQNNode(robot_info, map_node, start, goal, load_path="checkpoints/model_distance_9.pt", max_distance=9)
+    # dqn_node = DQNNode(robot_info, map_node, start, goal, load_path="checkpoints/model_distance_18.pt", max_distance=18)
     dqn_node = DQNNode(robot_info, map_node, start, goal)
 
     executor = rclpy.executors.MultiThreadedExecutor()
