@@ -17,6 +17,7 @@ from rclpy.node import Node
 import torch.nn.functional as F
 
 import os
+import time
 
 random.seed(0)
 
@@ -26,8 +27,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 128
 MEMORY_SIZE = 10000
 TARGET_UPDATE = 100
-# At checkpoint 17, lowered learning rate from 3e-4 to 1e-4, resumed training
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 3e-4
 CHANGE_MAP_COUNT = 1
 
 # Directions
@@ -59,7 +59,7 @@ CLOSER_REWARD = 1.0   # Give clear positive feedback
 FURTHER_REWARD = -.1 # Penalize for making the wrong move
 TIMESTEP_REWARD = -.1 # Encourage faster paths
 COLLISION_REWARD = -10.0
-STUCK_REWARD = -0.01   # Penalize being stuck
+STUCK_REWARD = -0.01    # Penalize being stuck
 REACHED_STEP_LIMIT_REWARD = -.8
 STEP_LIMIT = 250
 INITIAL_DISTANCE_LIMIT = 4
@@ -97,7 +97,7 @@ from collections import namedtuple
 
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
 
-# https://arxiv.org/abs/1511.05952 Prioritized Replay Buffer
+# https://arxiv.org/abs/1511.05952 Prioritiezed Replay Buffer
 class PrioritizedReplayBuffer:
     def __init__(self, capacity, alpha=0.6):
         self.capacity = capacity
@@ -165,10 +165,8 @@ class DQN(nn.Module):
             nn.Flatten(),
             nn.Linear(input_size, hidden_size),
             nn.ReLU(),
-            nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, output_size)
         )
 
@@ -404,13 +402,30 @@ class DQNLearner:
         elif steps == STEP_LIMIT: print("SIMULATED PATH HIT STEP LIMIT")
         self.prev_distance = self.robot_info.location.square_distance(self.robot_info.goal_loc)
         return path
+    
+    def get_step(self):
+        """
+        Take one step towards the goal and return the new location.
+        Assumes self.robot_info.location, self.robot_info.goal_loc, etc., have already been set.
+        """
+        state_obj = self.robot_info.get_state(self.map_node.grid)
+        state = self.get_full_state_vector(state_obj)
 
+        # Choose action (you can switch between select_action and select_action_boltzmann)
+        action = self.select_action_boltzmann(state, eval_mode=True, temperature=self.epsilon)
+
+        # Take the chosen action
+        self.take_action(action)
+        self.map_node.publish_map()
+
+
+        self.prev_distance = self.robot_info.location.square_distance(self.robot_info.goal_loc)
+
+        return Location(self.robot_info.location.x, self.robot_info.location.y)
     def compute_reward(self, start, goal, steps, robot_info=None):
         done_flag = False
         collided_flag = False
-        # reward_scale = 1 / math.sqrt(start.square_distance(goal))
-        distance = math.sqrt(start.square_distance(goal))
-        reward_scale = math.log(distance + 1) / distance if distance > 0 else 1
+        reward_scale = 1 / math.sqrt(start.square_distance(goal))
         if robot_info is None:
             robot_info = self.robot_info
 
@@ -512,7 +527,7 @@ class DQNLearner:
         print(f"[Checkpoint] Loaded model and training state from {load_path}")
 
 class DQNNode(Node):
-    def __init__(self, robot_info, map_node, start, goal, episodes=1000, load_path=None, max_distance=-1):
+    def __init__(self, robot_info, map_node, start, goal, episodes=1000, load_path=None, max_distance=-1, eval=False):
         super().__init__('dqn_node')
         self.path_pub = self.create_publisher(Path, '/dqn/path', 10)
         self.robot_info = robot_info
@@ -527,7 +542,14 @@ class DQNNode(Node):
         else:
             self.max_distance = INITIAL_DISTANCE_LIMIT
 
-        self.timer = self.create_timer(1.0 / FREQUENCY, self.train_loop)
+        if not eval:
+            self.timer = self.create_timer(1.0 / FREQUENCY, self.train_loop)
+        else:
+            # path = self.learner.get_path(self.start, self.goal, step_limit=self.max_distance * 2 * 4)
+            self.publish_each_step()
+            # print(path)
+            
+            
 
     def train_loop(self):
         reward = self.learner.train_episode(self.start, self.goal, self.max_distance*2 * 4)
@@ -541,7 +563,7 @@ class DQNNode(Node):
             print("Changed max distance to ", self.max_distance)
             self.learner.episode_successes = self.learner.episode_successes[-20:]
             self.learner.epsilon = max(self.learner.epsilon, 0.3)
-            self.learner.decay = 0.995
+            self.learner.decay = 0.997
 
             self.learner.save_checkpoint(f"checkpoints/model_distance_{self.max_distance}.pt", {
                 'start': self.start,
@@ -581,13 +603,57 @@ class DQNNode(Node):
 
         self.path_pub.publish(path_msg)
 
+    def publish_each_step(self):
+        path = []
+        step = self.learner.get_step()
+        while step != Location(18, 18):
+            path.append(step)
+
+            # Publish path as ROS message
+            path_msg = Path()
+            path_msg.header.frame_id = 'map'
+            path_msg.header.stamp = self.get_clock().now().to_msg()
+
+            for p in path:
+                pose = PoseStamped()
+                pose.header.frame_id = 'map'
+                pose.header.stamp = self.get_clock().now().to_msg()
+                pose.pose.position.x = float(p.x + 0.5)
+                pose.pose.position.y = float(p.y + 0.5)
+                pose.pose.orientation.w = 1.0
+                path_msg.poses.append(pose)
+
+            self.path_pub.publish(path_msg)
+
+            step = self.learner.get_step()
+            time.sleep(0.5)
+
+        print("FOUND GOAL")
+        path.append(step)
+
+        # Publish path as ROS message
+        path_msg = Path()
+        path_msg.header.frame_id = 'map'
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+
+        for p in path:
+            pose = PoseStamped()
+            pose.header.frame_id = 'map'
+            pose.header.stamp = self.get_clock().now().to_msg()
+            pose.pose.position.x = float(p.x + 0.5)
+            pose.pose.position.y = float(p.y + 0.5)
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+
+        self.path_pub.publish(path_msg)
+
 def main(args=None):
     rclpy.init(args=args)
 
     map_node = MovingMap()
 
-    start = Location(0, 0)
-    goal = Location(INITIAL_DISTANCE_LIMIT, INITIAL_DISTANCE_LIMIT)
+    start = Location(1, 1)
+    goal = Location(18, 18)
 
     robot_info = RobotInfo(
         location=start,
@@ -599,8 +665,8 @@ def main(args=None):
         map_width=GRID_WIDTH
     )
 
-    # dqn_node = DQNNode(robot_info, map_node, start, goal, load_path="checkpoints/model_distance_18.pt", max_distance=18)
-    dqn_node = DQNNode(robot_info, map_node, start, goal)
+    dqn_node = DQNNode(robot_info, map_node, start, goal, load_path="checkpoints/20x20_3obs/model_distance_18.pt", max_distance=18, eval=True)
+    # dqn_node = DQNNode(robot_info, map_node, start, goal)
 
     executor = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(dqn_node)

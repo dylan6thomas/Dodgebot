@@ -15,9 +15,9 @@ TF_ODOM_LINK = 'odom'
 RESOLUTION = 1.0  # meters
 # GRID_HEIGHT = 10
 # GRID_WIDTH = 10
-GRID_HEIGHT = 50
-GRID_WIDTH = 50
-NUM_RECTS = 10
+GRID_HEIGHT = 20
+GRID_WIDTH = 20
+NUM_RECTS = 3
 FREQUENCY = 1  # Hz
 
 UNKNOWN = -1
@@ -95,8 +95,8 @@ class MovingMap(Node):
       self.grid.fill(FREE)
       for obs in self.obstacles:
           r, c = int(obs.row), int(obs.col)            # top-left
-          self.grid[r  : r+2, c  : c+2] = 100   # 2×2 slice
-        #   self.grid[r  : r+1, c  : c+1] = 100   # 2×2 slice
+        #   self.grid[r  : r+2, c  : c+2] = 100   # 2×2 slice
+          self.grid[r  : r+1, c  : c+1] = 100   # 2×2 slice
 
     def publish_map(self):
         # move every rectangle one cell
