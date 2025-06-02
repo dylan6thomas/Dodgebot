@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import deque, namedtuple
-from qlearning import Location, RobotInfo, SCAN_HISTORY_LEN
+from robot_info import Location, RobotInfo, SCAN_HISTORY_LEN
 
 from obstacle_move import MovingMap, OCCUPIED, FREE, UNKNOWN, MAP_TOPIC, GRID_HEIGHT, GRID_WIDTH
 from geometry_msgs.msg import PoseStamped
