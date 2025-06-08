@@ -221,6 +221,7 @@ class QLearningAlgortihm(Node):
             path = self.get_best_path()
             if path:
                 # Get metrics if a best path is found 
+                self.follow_path(path)
                 path_reward = self.calculate_path_reward(path)
                 path_len = len(path) - 1
                 total_time = time.time() - self.training_time
@@ -306,7 +307,7 @@ class QLearningAlgortihm(Node):
         if state == self.goal:
             return best_path
         else: 
-            print("No path found")
+            print("No path found run code again")
             return []
 
     def bresenham_algorithm(self, path):
