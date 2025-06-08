@@ -6,6 +6,7 @@ Implements our map class with dynamic obstacle movements
 ### `qln_dynamic.py`
 This script implements a Q-learning algorithm allowing a robot to learn the optimal path from start to goal while avoiding moving obstacles. The script maintains and updates a Q-table based on rewards and publishes the highest reward path based on the policy. 
 
+Note: I used old code from previous assigments for the following functions follow_path, bresenham_algorithm, move_forward, stop, and spin. - Ose 
 To run:
 
 Terminal 1: 
